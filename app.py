@@ -1,8 +1,7 @@
 import re
 import html
-import time
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
 
@@ -13,7 +12,7 @@ import streamlit as st
 
 
 DB_PATH = "news_cache.db"
-USER_AGENT = "Mozilla/5.0 (compatible; NewsScanner/1.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; NewsScanner/2.0)"
 
 
 RSS_SOURCES = {
@@ -37,6 +36,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS articles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source TEXT,
+            source_type TEXT,
             title TEXT,
             url TEXT UNIQUE,
             published TEXT,
@@ -46,6 +46,13 @@ def init_db():
         )
         """
     )
+
+    # Lägg till kolumn om databasen skapats av äldre version
+    try:
+        cur.execute("ALTER TABLE articles ADD COLUMN source_type TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -58,12 +65,13 @@ def save_articles(articles):
         try:
             cur.execute(
                 """
-                INSERT OR IGNORE INTO articles
-                (source, title, url, published, summary, matched_keywords, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO articles
+                (source, source_type, title, url, published, summary, matched_keywords, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     article.get("source", ""),
+                    article.get("source_type", ""),
                     article.get("title", ""),
                     article.get("url", ""),
                     article.get("published", ""),
@@ -116,13 +124,27 @@ def parse_feed_date(entry):
     return None
 
 
-def keyword_match(text, keywords):
+def parse_keywords(text):
+    if not text:
+        return []
+    parts = re.split(r"[,;\n]+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def keyword_match(text, keywords, match_mode="any"):
+    if not keywords:
+        return []
+
     text_lower = text.lower()
     matched = [kw for kw in keywords if kw.lower() in text_lower]
+
+    if match_mode == "all":
+        return matched if len(matched) == len(keywords) else []
+
     return matched
 
 
-def fetch_rss(selected_sources, keywords, from_dt, to_dt):
+def fetch_rss(selected_sources, keywords, from_dt, to_dt, match_mode="any"):
     headers = {"User-Agent": USER_AGENT}
     results = []
 
@@ -142,7 +164,7 @@ def fetch_rss(selected_sources, keywords, from_dt, to_dt):
                 url = entry.get("link", "")
                 published_dt = parse_feed_date(entry)
 
-                if not published_dt:
+                if not url or not published_dt:
                     continue
 
                 if from_dt and published_dt < from_dt:
@@ -151,7 +173,7 @@ def fetch_rss(selected_sources, keywords, from_dt, to_dt):
                     continue
 
                 searchable_text = f"{title} {summary}"
-                matched = keyword_match(searchable_text, keywords)
+                matched = keyword_match(searchable_text, keywords, match_mode=match_mode)
 
                 if keywords and not matched:
                     continue
@@ -159,6 +181,7 @@ def fetch_rss(selected_sources, keywords, from_dt, to_dt):
                 results.append(
                     {
                         "source": source_name,
+                        "source_type": "RSS",
                         "title": title,
                         "url": url,
                         "published": published_dt.isoformat(),
@@ -174,24 +197,20 @@ def fetch_rss(selected_sources, keywords, from_dt, to_dt):
     return results
 
 
-def fetch_gdelt(keywords, from_dt, to_dt, max_records=50):
+def fetch_gdelt(keywords, from_dt, to_dt, max_records=100, match_mode="any"):
     if not keywords:
         return []
 
     query = " OR ".join([f'"{kw}"' if " " in kw else kw for kw in keywords])
-
     if not query.strip():
         return []
-
-    mode = "ArtList"
-    format_type = "json"
 
     url = (
         "https://api.gdeltproject.org/api/v2/doc/doc"
         f"?query={quote_plus(query)}"
-        f"&mode={mode}"
+        "&mode=ArtList"
         f"&maxrecords={max_records}"
-        f"&format={format_type}"
+        "&format=json"
     )
 
     try:
@@ -201,21 +220,21 @@ def fetch_gdelt(keywords, from_dt, to_dt, max_records=50):
     except Exception:
         return []
 
-    articles = []
+    results = []
 
     for item in data.get("articles", []):
         title = clean_text(item.get("title", ""))
         url = item.get("url", "")
         source = item.get("sourceCommonName") or item.get("domain") or "GDELT"
-        summary = clean_text(item.get("seendate", ""))
-
+        summary = clean_text(item.get("socialimage", "") or "")
         published_raw = item.get("seendate", "")
-        published_dt = None
 
         try:
-            # GDELT format example: 20260308T123000Z
             published_dt = datetime.strptime(published_raw, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
         except Exception:
+            continue
+
+        if not url or not title:
             continue
 
         if from_dt and published_dt < from_dt:
@@ -223,55 +242,63 @@ def fetch_gdelt(keywords, from_dt, to_dt, max_records=50):
         if to_dt and published_dt > to_dt:
             continue
 
-        searchable_text = f"{title} {summary}"
-        matched = keyword_match(searchable_text, keywords)
+        searchable_text = f"{title} {summary} {source}"
+        matched = keyword_match(searchable_text, keywords, match_mode=match_mode)
 
         if keywords and not matched:
             continue
 
-        articles.append(
+        results.append(
             {
                 "source": source,
+                "source_type": "GDELT",
                 "title": title,
                 "url": url,
                 "published": published_dt.isoformat(),
-                "summary": summary,
+                "summary": "",
                 "matched_keywords": ", ".join(matched),
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
             }
         )
 
-    return articles
+    return results
 
 
-def filter_df(df, keywords, selected_sources, from_dt, to_dt):
+def filter_df(df, keywords, selected_rss_sources, from_dt, to_dt, include_gdelt, match_mode="any"):
     if df.empty:
         return df
 
-    if selected_sources:
-        df = df[df["source"].isin(selected_sources)]
-
-    if keywords:
-        pattern = "|".join([re.escape(kw) for kw in keywords])
-        df = df[
-            df["title"].str.contains(pattern, case=False, na=False)
-            | df["summary"].str.contains(pattern, case=False, na=False)
-            | df["matched_keywords"].str.contains(pattern, case=False, na=False)
-        ]
+    df["published_dt"] = pd.to_datetime(df["published"], utc=True, errors="coerce")
+    df = df.dropna(subset=["published_dt"])
 
     if from_dt:
-        df = df[pd.to_datetime(df["published"], utc=True) >= pd.Timestamp(from_dt)]
-
+        df = df[df["published_dt"] >= pd.Timestamp(from_dt)]
     if to_dt:
-        df = df[pd.to_datetime(df["published"], utc=True) <= pd.Timestamp(to_dt)]
+        df = df[df["published_dt"] <= pd.Timestamp(to_dt)]
 
-    df = df.sort_values("published", ascending=False)
-    return df
+    # RSS filtreras på valda RSS-källor, GDELT får vara kvar om användaren valt GDELT
+    rss_mask = (df["source_type"] == "RSS") & (df["source"].isin(selected_rss_sources))
+    gdelt_mask = (df["source_type"] == "GDELT") if include_gdelt else False
 
+    df = df[rss_mask | gdelt_mask]
 
-def make_clickable(url, title):
-    safe_title = html.escape(title or url)
-    return f'<a href="{url}" target="_blank">{safe_title}</a>'
+    if keywords:
+        if match_mode == "all":
+            for kw in keywords:
+                df = df[
+                    df["title"].str.contains(re.escape(kw), case=False, na=False)
+                    | df["summary"].str.contains(re.escape(kw), case=False, na=False)
+                    | df["matched_keywords"].str.contains(re.escape(kw), case=False, na=False)
+                ]
+        else:
+            pattern = "|".join(re.escape(kw) for kw in keywords)
+            df = df[
+                df["title"].str.contains(pattern, case=False, na=False)
+                | df["summary"].str.contains(pattern, case=False, na=False)
+                | df["matched_keywords"].str.contains(pattern, case=False, na=False)
+            ]
+
+    return df.sort_values("published_dt", ascending=False)
 
 
 st.set_page_config(page_title="Nyhetsscanner", layout="wide")
@@ -285,50 +312,64 @@ with st.sidebar:
 
     keyword_input = st.text_area(
         "Nyckelord/sökord",
-        placeholder="Exempel: NATO, Karlskoga, Ukraina, försörjningstrygghet",
-        height=120,
+        value="",
+        placeholder="Exempel:\nNATO\nSverige\nUkraina",
+        help="Skriv ett sökord per rad, eller separera med kommatecken.",
+        height=140,
+    )
+
+    match_mode = st.radio(
+        "Träfflogik",
+        options=["any", "all"],
+        format_func=lambda x: "Minst ett sökord" if x == "any" else "Alla sökord måste finnas",
     )
 
     selected_sources = st.multiselect(
-        "Källor",
+        "RSS-källor",
         options=list(RSS_SOURCES.keys()),
         default=["SVT Nyheter", "Sveriges Radio Ekot", "BBC World", "Reuters World", "The Guardian World"],
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        from_date = st.date_input("Från datum", value=None)
-    with col2:
-        to_date = st.date_input("Till datum", value=None)
+    days_back = st.selectbox(
+        "Tidsperiod",
+        options=[1, 3, 7, 14, 30],
+        index=2,
+        format_func=lambda x: f"Senaste {x} dagarna",
+    )
 
     use_gdelt = st.checkbox("Använd även GDELT", value=True)
 
-    fetch_now = st.button("Hämta nyheter nu", type="primary")
-    reload_db = st.button("Ladda från lokal databas")
+    if st.button("Hämta nyheter nu", type="primary"):
+        st.session_state["fetch_now"] = True
 
-keywords = [k.strip() for k in re.split(r"[,;\n]+", keyword_input) if k.strip()]
+keywords = parse_keywords(keyword_input)
 
-from_dt = None
-to_dt = None
+to_dt = datetime.now(timezone.utc)
+from_dt = to_dt - timedelta(days=days_back)
 
-if from_date:
-    from_dt = datetime.combine(from_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-
-if to_date:
-    to_dt = datetime.combine(to_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-
-if fetch_now:
+if st.session_state.get("fetch_now"):
     with st.spinner("Hämtar nyheter..."):
         all_articles = []
 
-        rss_articles = fetch_rss(selected_sources, keywords, from_dt, to_dt)
+        rss_articles = fetch_rss(
+            selected_sources,
+            keywords,
+            from_dt,
+            to_dt,
+            match_mode=match_mode,
+        )
         all_articles.extend(rss_articles)
 
         if use_gdelt:
-            gdelt_articles = fetch_gdelt(keywords, from_dt, to_dt, max_records=100)
+            gdelt_articles = fetch_gdelt(
+                keywords,
+                from_dt,
+                to_dt,
+                max_records=100,
+                match_mode=match_mode,
+            )
             all_articles.extend(gdelt_articles)
 
-        # Deduplicera på URL
         dedup = {}
         for article in all_articles:
             url = article.get("url", "").strip()
@@ -339,13 +380,18 @@ if fetch_now:
         save_articles(unique_articles)
 
         st.success(f"Hämtade {len(unique_articles)} artiklar.")
+        st.session_state["fetch_now"] = False
 
-if reload_db or fetch_now:
-    df = load_articles()
-else:
-    df = load_articles()
-
-filtered_df = filter_df(df, keywords, selected_sources, from_dt, to_dt)
+df = load_articles()
+filtered_df = filter_df(
+    df,
+    keywords,
+    selected_sources,
+    from_dt,
+    to_dt,
+    use_gdelt,
+    match_mode=match_mode,
+)
 
 st.subheader("Resultat")
 
@@ -353,28 +399,37 @@ if filtered_df.empty:
     st.info("Inga träffar hittades.")
 else:
     display_df = filtered_df.copy()
-    display_df["published"] = pd.to_datetime(display_df["published"], utc=True).dt.strftime("%Y-%m-%d %H:%M")
-    display_df["Länk"] = display_df.apply(lambda row: make_clickable(row["url"], row["title"]), axis=1)
+    display_df["publicerad"] = display_df["published_dt"].dt.strftime("%Y-%m-%d %H:%M")
+    display_df["öppna"] = display_df["url"]
 
     display_df = display_df[
-        ["published", "source", "matched_keywords", "Länk", "summary"]
+        ["publicerad", "source_type", "source", "matched_keywords", "title", "öppna"]
     ].rename(
         columns={
-            "published": "Publicerad",
+            "publicerad": "Publicerad",
+            "source_type": "Typ",
             "source": "Källa",
-            "matched_keywords": "Matchade sökord",
-            "summary": "Sammanfattning / metadata",
+            "matched_keywords": "Sökordsträff",
+            "title": "Rubrik",
+            "öppna": "Länk",
         }
     )
 
-    st.markdown(
-        display_df.to_html(escape=False, index=False),
-        unsafe_allow_html=True,
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Länk": st.column_config.LinkColumn(
+                "Länk",
+                display_text="Öppna artikel",
+            )
+        },
     )
 
-    csv_data = filtered_df.to_csv(index=False).encode("utf-8")
+    csv_data = filtered_df.drop(columns=["published_dt"], errors="ignore").to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Ladda ner resultat som CSV",
+        "Ladda ner resultat som CSV",
         data=csv_data,
         file_name="nyhetstraffar.csv",
         mime="text/csv",
